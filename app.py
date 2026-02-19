@@ -2,194 +2,161 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, timedelta
+import plotly.graph_objects as go
+from datetime import datetime
 
-# Configuración de página
-st.set_page_config(page_title="DeFi Strategy Backtester", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="DeFi Strategist: WBTC/USDC", layout="wide")
 
-st.title("🛡️ Estrategia DeFi: Liquidez Concentrada + AAVE (WBTC/USDC)")
+st.title("🛡️ DeFi Alpha Backtester: WBTC/USDC")
 st.markdown("""
-Esta aplicación simula una estrategia de inversión recurrente en el par WBTC/USDC con gestión activa de colateral y compras oportunistas.
+Esta aplicación simula una estrategia avanzada de **Liquidez Concentrada** integrada con **AAVE** y **Compras de Drawdown**.
+Calcula ATH diarios y gestiona colaterales dinámicamente.
 """)
 
-# --- SIDEBAR: PARÁMETROS ---
+# --- SIDEBAR: PARÁMETROS DINÁMICOS ---
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    start_date = st.date_input("Fecha de inicio", value=datetime(2020, 1, 1))
-    end_date = st.date_input("Fecha de fin", value=datetime(2026, 1, 31))
+    st.header("⚙️ Parámetros del Sistema")
+    start_date = st.date_input("Fecha Inicio", value=datetime(2020, 1, 1))
     
-    freq = st.selectbox("Periodicidad de inversión", ["Semanal", "Quincenal", "Mensual"], index=2)
-    investment_per_period = st.number_input("Inversión por periodo (USD)", value=1000)
+    freq_label = st.selectbox("Periodicidad de Inversión", ["Semanal", "Quincenal", "Mensual"], index=2)
+    inv_amount = st.number_input("Inversión por Periodo ($)", value=1000)
     
-    st.subheader("📊 Parámetros del Pool")
+    st.subheader("📊 Pool de Liquidez")
     range_pct = st.slider("Rango del Pool (±%)", 5, 50, 30) / 100
-    pool_apr = st.number_input("APR estimado del Pool (%)", value=10.0) / 100
+    pool_apr = st.number_input("APR Pool (%)", value=10.0) / 100
     
-    st.subheader("👻 Parámetros AAVE")
-    aave_lending_apr = st.number_input("APR Depósito USDC (%)", value=3.0) / 100
-    health_factor_target = st.number_input("Health Factor objetivo (Borrow)", value=2.5, step=0.1)
-    # LTV estándar de WBTC en AAVE es ~70-75%
-    ltv_wbtc = 0.73 
+    st.subheader("👻 Configuración AAVE")
+    aave_apr = st.number_input("APR Lending USDC (%)", value=3.0) / 100
+    hf_target = st.number_input("Health Factor Objetivo", value=2.5, step=0.1)
     
-    st.subheader("📉 Compra en Drawdown")
-    dd_trigger = st.slider("Compra al Drawdown (%)", 20, 80, 50) / 100
-    buy_pct_from_aave = st.slider("% de Caja USDC a invertir en caída", 10, 100, 50) / 100
+    st.subheader("📉 Estrategia de Drawdown")
+    dd_trigger = st.slider("Gatillo Compra (%)", 20, 80, 50) / 100
+    buy_from_aave = st.slider("% Capital AAVE a Invertir", 10, 100, 50) / 100
 
-# --- LÓGICA DE BACKTESTING ---
-
+# --- MOTOR DE DATOS ---
 @st.cache_data
-def get_data(start, end):
-    df = yf.download("BTC-USD", start=start, end=end, interval="1d")
-    if isinstance(df.columns, pd.MultiIndex): # Limpieza para nuevas versiones de yfinance
+def load_data(start):
+    # Descarga datos diarios para máxima precisión en ATH y Drawdown
+    df = yf.download("BTC-USD", start=start, interval="1d")
+    if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df[['Adj Close']].rename(columns={'Adj Close': 'Price'})
     return df
 
-data = get_data(start_date, end_date)
+data = load_data(start_date)
 
-def run_simulation():
-    # Variables de estado
-    cash_aave = 0  # USDC en Lending
-    wbtc_collateral_value = 0 # Valor en USD del WBTC en AAVE
-    wbtc_units = 0 # Unidades de WBTC
-    debt_usdc = 0 # Deuda en USDC
+# --- MOTOR DE SIMULACIÓN ---
+def run_simulation(df, freq_days, inv, r_pct, p_apr, a_apr, hf, ddt, b_pct):
+    cash_aave = 0  # USDC estable
+    wbtc_units = 0 # WBTC como colateral
+    debt_usdc = 0  # Deuda en AAVE
     active_pools = []
     history = []
     
-    # Métrica de frecuencia
+    ath = 0
     days_map = {"Semanal": 7, "Quincenal": 15, "Mensual": 30}
-    period_days = days_map[freq]
+    period = days_map[freq_days]
     
-    current_ath = 0
-    last_investment_day = -period_days
+    last_inv_idx = -period
     
-    # Iteración diaria (Backtesting de alta fidelidad)
-    prices = data['Price'].values
-    dates = data.index
-    
-    for i in range(len(data)):
-        current_price = float(prices[i])
-        current_date = dates[i]
+    for i in range(len(df)):
+        price = float(df['Price'].values[i])
+        date = df.index[i]
         
-        # 1. Actualizar ATH y calcular Drawdown
-        if current_price > current_ath:
-            current_ath = current_price
-            # GATILLO: RESET TOTAL EN ATH
-            if debt_usdc > 0 or wbtc_units > 0:
-                # Vender todo el WBTC, pagar deuda y meter a AAVE
-                final_sale = (wbtc_units * current_price) - debt_usdc
-                cash_aave += final_sale
+        # 1. Gestión de ATH y Reset
+        if price > ath:
+            ath = price
+            # REBALANCEO TOTAL EN ATH: Limpiar deuda y colateral
+            if wbtc_units > 0:
+                final_val = (wbtc_units * price) - debt_usdc
+                cash_aave += final_val
                 wbtc_units = 0
-                wbtc_collateral_value = 0
                 debt_usdc = 0
 
-        drawdown = (current_price - current_ath) / current_ath
+        drawdown = (price - ath) / ath
         
-        # 2. Rendimiento AAVE (Lending)
-        cash_aave *= (1 + aave_lending_apr / 365)
+        # 2. Interés AAVE diario
+        cash_aave *= (1 + a_apr / 365)
         
-        # 3. GATILLO: COMPRA EN DRAWDOWN CRÍTICO
-        if drawdown <= -dd_trigger and cash_aave > 100:
-            buy_amount = cash_aave * buy_pct_from_aave
-            cash_aave -= buy_amount
-            new_wbtc = buy_amount / current_price
-            wbtc_units += new_wbtc
-            # Abrir Borrow para generar más liquidez
-            # Borrow = (Valor / HF) * LTV (aprox simplificado por HF target)
-            new_debt = (buy_amount / health_factor_target)
-            debt_usdc += new_debt
-            # Esa deuda abre una nueva pool extra
+        # 3. Gatillo de Compra en Caída (Buy the Dip)
+        if drawdown <= -ddt and cash_aave > 100:
+            spent = cash_aave * b_pct
+            cash_aave -= spent
+            wbtc_units += (spent / price)
+            # Generar Borrow para nuevas pools
+            new_loan = spent / hf
+            debt_usdc += new_loan
             active_pools.append({
-                'entry_price': current_price,
-                'capital': new_debt,
-                'upper': current_price * (1 + range_pct),
-                'lower': current_price * (1 - range_pct),
-                'fees': 0
+                'cap': new_loan, 'entry': price, 'fees': 0,
+                'up': price * (1 + r_pct), 'low': price * (1 - r_pct)
             })
 
-        # 4. Inversión Recurrente (DCA)
-        days_since_last = (current_date - dates[max(0, i+last_investment_day)]).days
-        if i == 0 or (i - last_investment_day) >= period_days:
+        # 4. Inversión Recurrente
+        if (i - last_inv_idx) >= period:
             active_pools.append({
-                'entry_price': current_price,
-                'capital': investment_per_period,
-                'upper': current_price * (1 + range_pct),
-                'lower': current_price * (1 - range_pct),
-                'fees': 0
+                'cap': inv, 'entry': price, 'fees': 0,
+                'up': price * (1 + r_pct), 'low': price * (1 - r_pct)
             })
-            last_investment_day = i
+            last_inv_idx = i
 
-        # 5. Gestión de Pools Activas
+        # 5. Procesar Pools
         still_active = []
-        for pool in active_pools:
-            # Acumular fees si está en rango
-            if pool['lower'] <= current_price <= pool['upper']:
-                pool['fees'] += pool['capital'] * (pool_apr / 365)
-                still_active.append(pool)
-            
-            # Salida por ARRIBA (USDC)
-            elif current_price > pool['upper']:
-                # Venta de la mitad WBTC con profit medio + capital original + fees
-                profit_wbtc = (pool['capital'] / 2) * (range_pct / 2) # Profit medio
-                exit_value = pool['capital'] + profit_wbtc + pool['fees']
-                cash_aave += exit_value
-            
-            # Salida por ABAJO (WBTC)
-            elif current_price < pool['lower']:
-                # Se convierte en WBTC colateral
-                units = pool['capital'] / current_price
+        for p in active_pools:
+            if p['low'] <= price <= p['up']:
+                p['fees'] += p['cap'] * (p_apr / 365)
+                still_active.append(p)
+            elif price > p['up']: # Salida por arriba (USDC)
+                profit = (p['cap'] * 0.5) * (r_pct * 0.5) # Profit medio WBTC vendido
+                cash_aave += (p['cap'] + profit + p['fees'])
+            elif price < p['low']: # Salida por abajo (WBTC a Colateral)
+                units = p['cap'] / price
                 wbtc_units += units
-                # Abrir borrow del 1/HF para seguir invirtiendo
-                borrowed = (pool['capital'] / health_factor_target)
-                debt_usdc += borrowed
-                # Re-invertir el borrow en una nueva pool
+                loan = p['cap'] / hf
+                debt_usdc += loan
+                # Abrir nueva pool con el préstamo
                 still_active.append({
-                    'entry_price': current_price,
-                    'capital': borrowed,
-                    'upper': current_price * (1 + range_pct),
-                    'lower': current_price * (1 - range_pct),
-                    'fees': 0
+                    'cap': loan, 'entry': price, 'fees': 0,
+                    'up': price * (1 + r_pct), 'low': price * (1 - r_pct)
                 })
-        
         active_pools = still_active
-        
-        # Valoración total de la cartera
-        total_pool_val = sum([p['capital'] for p in active_pools])
-        total_value = cash_aave + (wbtc_units * current_price) - debt_usdc + total_pool_val
+
+        # Valoración
+        pool_val = sum([p['cap'] for p in active_pools])
+        portfolio_val = cash_aave + (wbtc_units * price) - debt_usdc + pool_val
         
         history.append({
-            'Date': current_date,
-            'Price': current_price,
-            'Cash_Aave': cash_aave,
-            'Total_Value': total_value,
+            'Fecha': date, 'Precio': price, 'ATH': ath,
+            'Cartera': portfolio_val, 'Aave_USDC': cash_aave,
             'Drawdown': drawdown
         })
         
     return pd.DataFrame(history)
 
-# Ejecutar Simulación
-results = run_simulation()
+# Ejecución
+res = run_simulation(data, freq_label, inv_amount, range_pct, pool_apr, aave_apr, hf_target, dd_trigger, buy_from_aave)
 
-# --- VISUALIZACIÓN ---
-col1, col2, col3 = st.columns(3)
-final_val = results['Total_Value'].iloc[-1]
-total_invested = (len(results) // (30 if freq=="Mensual" else 15 if freq=="Quincenal" else 7)) * investment_per_period
-roi = (final_val - total_invested) / total_invested * 100
+# --- UI: MÉTRICAS Y GRÁFICOS ---
+c1, c2, c3 = st.columns(3)
+final_v = res['Cartera'].iloc[-1]
+total_periods = len(data) // (7 if freq_label=="Semanal" else 15 if freq_label=="Quincenal" else 30)
+total_inv = total_periods * inv_amount
+c1.metric("Valor Portafolio", f"${final_v:,.0f}")
+c2.metric("Inversión Total", f"${total_inv:,.0f}")
+c3.metric("ROI Estrategia", f"{((final_v/total_inv)-1)*100:.2f}%")
 
-col1.metric("Valor Final Cartera", f"${final_val:,.2f}")
-col2.metric("Inversión Total", f"${total_invested:,.2f}")
-col3.metric("ROI Total", f"{roi:.2f}%")
+# Gráfico Principal
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=res['Fecha'], y=res['Cartera'], name="Valor Cartera ($)", line=dict(color='#00ffcc')))
+fig.add_trace(go.Scatter(x=res['Fecha'], y=res['Precio'], name="Precio BTC ($)", yaxis="y2", line=dict(color='rgba(255,255,255,0.2)')))
+fig.update_layout(
+    title="Evolución de la Cartera vs BTC",
+    yaxis=dict(title="Cartera USD"),
+    yaxis2=dict(title="BTC Price", overlaying="y", side="right"),
+    template="plotly_dark"
+)
+st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("Evolución del Portafolio vs Precio BTC")
-# Crear gráfico con dos ejes
-st.line_chart(results.set_index('Date')[['Total_Value']])
-
-st.subheader("Métricas de Riesgo")
-max_dd = results['Drawdown'].min() * 100
-st.warning(f"El Max Drawdown histórico de Bitcoin en este periodo fue de {max_dd:.2f}%")
-
-# Mostrar tabla de datos
-with st.expander("Ver desglose diario"):
-    st.dataframe(results)
-
-st.success(f"Estrategia finalizada. ATH detectado en el periodo: ${results['Price'].max():,.2f}")
+# Tabla de Auditoría
+with st.expander("📄 Ver desglose de operaciones diarias"):
+    st.write(res)
