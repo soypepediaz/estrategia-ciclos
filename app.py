@@ -24,21 +24,34 @@ with st.sidebar:
     dd_trigger = st.slider("Compra al Drawdown (%)", 20, 80, 50) / 100
     buy_from_aave = st.slider("% Capital Aave a Invertir", 10, 100, 50) / 100
 
-# --- MOTOR DE DATOS ---
+# --- MOTOR DE DATOS CORREGIDO ---
 @st.cache_data
 def load_data(start):
     try:
+        # Descargamos los datos
         df = yf.download("BTC-USD", start=start, interval="1d")
+        
         if df.empty:
+            st.error("Yahoo Finance devolvió un dataframe vacío.")
             return None
-        # Aplanar MultiIndex de columnas si existe
+            
+        # 1. Aplanar MultiIndex (si existe)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        # Limpiar y renombrar
-        df = df[['Adj Close']].rename(columns={'Adj Close': 'Price'})
+        
+        # 2. Intentar encontrar la columna de precio de forma robusta
+        if 'Adj Close' in df.columns:
+            df = df[['Adj Close']].rename(columns={'Adj Close': 'Price'})
+        elif 'Close' in df.columns:
+            df = df[['Close']].rename(columns={'Close': 'Price'})
+        else:
+            # Si no encuentra ninguna, toma la primera columna numérica disponible
+            df = df.iloc[:, [0]]
+            df.columns = ['Price']
+            
         return df
     except Exception as e:
-        st.error(f"Error descargando datos: {e}")
+        st.error(f"Error técnico al procesar columnas: {e}")
         return None
 
 data = load_data(start_date)
